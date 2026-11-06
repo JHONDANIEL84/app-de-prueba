@@ -1,15 +1,31 @@
 import { NextResponse } from "next/server";
-import { Client } from "@gradio/client";
+import { Client, handle_file } from "@gradio/client";
 
-export const maxDuration = 120; // Vercel function timeout config (up to 120s if Pro, default 60s)
+export const maxDuration = 120; // Vercel function timeout config
 export const dynamic = "force-dynamic";
+
+// Convert base64 data URL to Blob for Gradio upload
+function dataURLtoBlob(dataurl) {
+  const arr = dataurl.split(",");
+  const mime = arr[0].match(/:(.*?);/)[1];
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while (n--) {
+    u8arr[n] = bstr.charCodeAt(n);
+  }
+  return new Blob([u8arr], { type: mime });
+}
 
 export async function POST(request) {
   try {
     const body = await request.json();
     const { 
+      mode = "create", // "create" (text-to-image) or "edit" (image-to-image)
       prompt, 
       negative_prompt = "", 
+      input_image = null, // base64 string
+      strength = 0.75, // image modification strength
       aspect_ratio = "1:1",
       seed = Math.floor(Math.random() * 1000000),
       steps = 25,
@@ -19,36 +35,76 @@ export async function POST(request) {
     } = body;
 
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
-      return NextResponse.json({ error: "El prompt es obligatorio" }, { status: 400 });
+      return NextResponse.json({ error: "Describe lo que deseas generar o modificar" }, { status: 400 });
     }
 
     const token = customToken || process.env.HF_TOKEN || undefined;
-
-    // Conectar al Space de Gradio
     const clientOptions = token ? { hf_token: token } : {};
     const client = await Client.connect(customSpace, clientOptions);
 
     let result;
-    try {
-      // Intentar predicción estándar por endpoint /predict o /generate
-      result = await client.predict("/predict", [
-        prompt,
-        negative_prompt,
-        seed,
-        guidance_scale,
-        steps,
-      ]);
-    } catch (predictErr) {
-      // Si falla /predict, intentar con el primer endpoint disponible (índice 0 o named)
+
+    if (mode === "edit" && input_image) {
+      // Modo Edición / Modificación de Imagen existente
+      const blob = dataURLtoBlob(input_image);
+      const imageParam = typeof handle_file === "function" ? handle_file(blob) : blob;
+
+      // Intentar diferentes formatos de endpoints de edición en Gradio
       try {
-        result = await client.predict(0, [
+        result = await client.predict("/edit", [
+          imageParam,
+          prompt,
+          negative_prompt,
+          strength,
+          seed,
+        ]);
+      } catch (e1) {
+        try {
+          result = await client.predict("/image_to_image", [
+            imageParam,
+            prompt,
+            negative_prompt,
+            strength,
+          ]);
+        } catch (e2) {
+          try {
+            // Intento con parámetros ordenados (prompt, image)
+            result = await client.predict(0, [
+              prompt,
+              imageParam,
+              negative_prompt,
+              seed,
+            ]);
+          } catch (e3) {
+            // Intento con (image, prompt)
+            result = await client.predict(0, [
+              imageParam,
+              prompt,
+              seed,
+            ]);
+          }
+        }
+      }
+    } else {
+      // Modo Creación (Texto a Imagen)
+      try {
+        result = await client.predict("/predict", [
           prompt,
           negative_prompt,
           seed,
+          guidance_scale,
+          steps,
         ]);
-      } catch (fallbackErr) {
-        // Intento con sólo el prompt
-        result = await client.predict(0, [prompt]);
+      } catch (predictErr) {
+        try {
+          result = await client.predict(0, [
+            prompt,
+            negative_prompt,
+            seed,
+          ]);
+        } catch (fallbackErr) {
+          result = await client.predict(0, [prompt]);
+        }
       }
     }
 
@@ -73,7 +129,7 @@ export async function POST(request) {
 
     if (!imageUrl) {
       return NextResponse.json({ 
-        error: "No se pudo recuperar la imagen generada por el Space.",
+        error: "No se pudo recuperar la imagen modificada por el Space.",
         raw: result ? result.data : null 
       }, { status: 502 });
     }
@@ -85,11 +141,11 @@ export async function POST(request) {
       prompt,
     });
   } catch (error) {
-    console.error("Error generating image:", error);
+    console.error("Error en generación/edición:", error);
     return NextResponse.json(
       { 
-        error: error.message || "Error al conectar con Hugging Face Space",
-        details: "Asegúrate de que el Space esté activo en Hugging Face o prueba configurando un HF_TOKEN."
+        error: error.message || "Error al procesar con Hugging Face",
+        details: "El Space puede estar en reposo temporal o procesando otra petición. Vuelve a intentarlo en unos segundos."
       },
       { status: 500 }
     );
