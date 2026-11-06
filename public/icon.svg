@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366F1" />
+      <stop offset="50%" stop-color="#8B5CF6" />
+      <stop offset="100%" stop-color="#EC4899" />
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A855F7" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#3B82F6" stop-opacity="0.1"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="#090D16" />
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="url(#glow)" />
+  <!-- Sparkle / Magic Wand Icon -->
+  <path d="M256 96L282 202L388 228L282 254L256 360L230 254L124 228L230 202L256 96Z" fill="url(#grad)" />
+  <path d="M368 320L380 368L428 380L380 392L368 440L356 392L308 380L356 368L368 320Z" fill="#38BDF8" opacity="0.9" />
+  <path d="M144 336L152 368L184 376L152 384L144 416L136 384L104 376L136 368L144 336Z" fill="#F43F5E" opacity="0.8" />
+</svg>
