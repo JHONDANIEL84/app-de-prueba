@@ -8,15 +8,13 @@ import {
   RefreshCw, 
   Settings, 
   Image as ImageIcon, 
-  Upload,
   Camera,
   Wand2,
   X,
   History,
   Check,
   Eye,
-  SlidersHorizontal,
-  ArrowRight
+  SlidersHorizontal
 } from "lucide-react";
 
 const STYLES = [
@@ -36,15 +34,28 @@ const PRESET_CREATION_PROMPTS = [
 ];
 
 const PRESET_EDIT_PROMPTS = [
-  "Transforma esta foto al estilo anime japonés de Studio Ghibli",
+  "Transforma esta foto al estilo anime de Studio Ghibli",
   "Agrega ropa y accesorios estilo cyberpunk con luces de neón",
   "Convierte esta imagen en una pintura clásica al óleo renacentista",
   "Cambia el fondo actual por una playa paradisíaca al atardecer",
   "Transforma a la persona en un héroe medieval con armadura dorada",
-  "Haz que parezca un póster de película cinematográfica en alta definición",
 ];
 
-// Comprimir imagen usando Canvas para optimizar subidas desde móvil y evitar límites de Vercel
+function mapRatioToSize(ratio) {
+  switch (ratio) {
+    case "16:9":
+      return "1344x768 (16:9)";
+    case "9:16":
+      return "768x1344 (9:16)";
+    case "4:3":
+      return "1184x864 (4:3)";
+    case "3:4":
+      return "864x1184 (3:4)";
+    default:
+      return "1024x1024 (1:1)";
+  }
+}
+
 function compressImage(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -80,23 +91,35 @@ function compressImage(file) {
   });
 }
 
+function dataURLtoBlob(dataurl) {
+  const arr = dataurl.split(",");
+  const mime = arr[0].match(/:(.*?);/)[1];
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while (n--) {
+    u8arr[n] = bstr.charCodeAt(n);
+  }
+  return new Blob([u8arr], { type: mime });
+}
+
 export default function Home() {
-  const [mode, setMode] = useState("create"); // "create" | "edit"
+  const [mode, setMode] = useState("create");
   const [prompt, setPrompt] = useState("");
   const [selectedStyle, setSelectedStyle] = useState(null);
   const [aspectRatio, setAspectRatio] = useState("1:1");
   const [loading, setLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState("Conectando con GPU...");
   const [currentImage, setCurrentImage] = useState(null);
-  const [inputImage, setInputImage] = useState(null); // Imagen base para editar
-  const [showOriginal, setShowOriginal] = useState(false); // Comparador antes/después
-  const [strength, setStrength] = useState(0.75); // Nivel de cambio
+  const [inputImage, setInputImage] = useState(null);
+  const [showOriginal, setShowOriginal] = useState(false);
   const [error, setError] = useState(null);
   const [history, setHistory] = useState([]);
   const [elapsedTime, setElapsedTime] = useState(0);
 
   const fileInputRef = useRef(null);
 
-  // Modal de ajustes
+  // Settings
   const [showSettings, setShowSettings] = useState(false);
   const [hfToken, setHfToken] = useState("");
   const [spaceName, setSpaceName] = useState("FelyaHuhing/qwen-image-21-uncensored");
@@ -112,9 +135,7 @@ export default function Home() {
 
       const savedSpace = localStorage.getItem("qwen_space_name");
       if (savedSpace) setSpaceName(savedSpace);
-    } catch (e) {
-      console.warn(e);
-    }
+    } catch (e) {}
   }, []);
 
   useEffect(() => {
@@ -144,7 +165,7 @@ export default function Home() {
       setMode("edit");
       showToast("Foto cargada con éxito 📸");
     } catch (err) {
-      setError("No se pudo cargar la imagen seleccionada");
+      setError("No se pudo procesar la imagen seleccionada");
     }
   };
 
@@ -162,35 +183,100 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setShowOriginal(false);
+    setLoadingStatus("Conectando con GPU de Hugging Face...");
 
     const fullPrompt = prompt + (selectedStyle ? selectedStyle.promptSuffix : "");
 
     try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode,
-          prompt: fullPrompt,
-          input_image: mode === "edit" ? inputImage : null,
-          strength,
-          aspect_ratio: aspectRatio,
-          customSpace: spaceName,
-          customToken: hfToken,
-        }),
-      });
+      let finalImageUrl = null;
 
-      const data = await res.json();
+      // 1. INTENTO DIRECTO: Conectar desde el navegador con @gradio/client
+      // Esto evita al 100% el límite de 10 segundos de Vercel
+      try {
+        setLoadingStatus("Enviando petición a Qwen AI...");
+        const { Client, handle_file } = await import("@gradio/client");
+        const client = await Client.connect(spaceName, hfToken ? { hf_token: hfToken } : {});
+        
+        setLoadingStatus("Procesando imagen en ZeroGPU...");
 
-      if (!res.ok || data.error) {
-        throw new Error(data.error || "Error al procesar la imagen");
+        let result;
+        if (mode === "edit" && inputImage) {
+          const blob = dataURLtoBlob(inputImage);
+          const imgParam = typeof handle_file === "function" ? handle_file(blob) : blob;
+
+          result = await client.predict("/edit", {
+            prompt: fullPrompt,
+            input_image: imgParam,
+            extra_images: [],
+            steps: 25,
+            seed: 0,
+            randomize_seed: true,
+            lora_scale: 1.0,
+          });
+        } else {
+          result = await client.predict("/generate", {
+            prompt: fullPrompt,
+            size: mapRatioToSize(aspectRatio),
+            steps: 25,
+            seed: 0,
+            randomize_seed: true,
+            lora_scale: 1.0,
+          });
+        }
+
+        if (result && result.data && Array.isArray(result.data)) {
+          const first = result.data[0];
+          if (typeof first === "string") {
+            finalImageUrl = first;
+          } else if (first && typeof first === "object") {
+            finalImageUrl = first.url || first.path;
+          }
+        }
+      } catch (directErr) {
+        console.warn("Conexión directa falló, intentando vía servidor de respaldo:", directErr);
+        
+        // 2. FALLBACK: Vía API de Next.js
+        setLoadingStatus("Procesando por servidor alternativo...");
+        const res = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode,
+            prompt: fullPrompt,
+            input_image: mode === "edit" ? inputImage : null,
+            aspect_ratio: aspectRatio,
+            customSpace: spaceName,
+            customToken: hfToken,
+          }),
+        });
+
+        const textResponse = await res.text();
+        let data;
+        try {
+          data = JSON.parse(textResponse);
+        } catch {
+          if (textResponse.includes("FUNCTION_INVOCATION_TIMEOUT") || res.status === 504) {
+            throw new Error("El modelo tardó más de 10s en responder. Por favor reintenta en un momento cuando la GPU esté lista.");
+          }
+          throw new Error("Respuesta inválida del servidor: " + (textResponse.slice(0, 80) || "Error desconocido"));
+        }
+
+        if (!res.ok || data.error) {
+          throw new Error(data.error || "Error al procesar la imagen");
+        }
+
+        finalImageUrl = data.imageUrl;
       }
 
-      setCurrentImage(data.imageUrl);
+      if (!finalImageUrl) {
+        throw new Error("No se pudo obtener la imagen generada.");
+      }
+
+      setCurrentImage(finalImageUrl);
 
       const newEntry = {
         id: Date.now(),
-        url: data.imageUrl,
+        url: finalImageUrl,
         prompt: fullPrompt,
         mode,
         createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -211,7 +297,7 @@ export default function Home() {
 
   const handleDownload = async (imgUrl) => {
     try {
-      showToast("Preparando descarga...");
+      showToast("Descargando imagen...");
       const response = await fetch(imgUrl);
       const blob = await response.blob();
       const blobUrl = window.URL.createObjectURL(blob);
@@ -222,7 +308,7 @@ export default function Home() {
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(blobUrl);
-      showToast("Guardado en tu celular ✅");
+      showToast("Guardado en descargas ✅");
     } catch (err) {
       window.open(imgUrl, "_blank");
     }
@@ -254,7 +340,6 @@ export default function Home() {
 
   return (
     <div className="flex flex-col min-h-screen bg-[#070A11] text-slate-100 max-w-md mx-auto relative shadow-2xl overflow-hidden pb-12">
-      {/* Input oculto para subida de fotos / cámara */}
       <input 
         type="file" 
         ref={fileInputRef} 
@@ -263,7 +348,7 @@ export default function Home() {
         className="hidden" 
       />
 
-      {/* Notificación Toast */}
+      {/* Toast */}
       {toastMessage && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-indigo-600/95 text-white px-4 py-2 rounded-full text-xs font-semibold shadow-lg backdrop-blur flex items-center gap-2 animate-bounce">
           <Check className="w-4 h-4" />
@@ -271,7 +356,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* Barra superior */}
+      {/* Header */}
       <header className="px-4 py-3 flex items-center justify-between border-b border-slate-800/80 bg-[#0B101D]/80 backdrop-blur sticky top-0 z-40">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-md shadow-indigo-500/20">
@@ -281,7 +366,7 @@ export default function Home() {
             <h1 className="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
               Qwen Studio
               <span className="text-[10px] font-medium bg-indigo-950 text-indigo-400 border border-indigo-800/60 px-1.5 py-0.5 rounded-full">
-                AI Pro
+                ZeroGPU
               </span>
             </h1>
             <p className="text-[11px] text-slate-400 truncate max-w-[170px]">
@@ -299,7 +384,7 @@ export default function Home() {
         </button>
       </header>
 
-      {/* Selector de Modo (Crear vs Modificar Foto) */}
+      {/* Modo Selector */}
       <div className="px-4 pt-3">
         <div className="grid grid-cols-2 p-1 bg-slate-900/90 rounded-2xl border border-slate-800">
           <button
@@ -330,9 +415,8 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Contenido principal */}
+      {/* Main Container */}
       <main className="flex-1 px-4 py-3 space-y-3.5 overflow-y-auto">
-        {/* Banner de imagen base cargada en modo edición */}
         {mode === "edit" && (
           <div className="p-3 bg-slate-900/80 rounded-2xl border border-slate-800 flex items-center justify-between gap-3">
             {inputImage ? (
@@ -344,22 +428,20 @@ export default function Home() {
                     className="w-11 h-11 rounded-xl object-cover border border-indigo-500/50 flex-shrink-0" 
                   />
                   <div className="overflow-hidden">
-                    <p className="text-xs font-semibold text-slate-200">Foto lista para editar</p>
-                    <p className="text-[10px] text-indigo-400">Toca modificar abajo para aplicar cambios</p>
+                    <p className="text-xs font-semibold text-slate-200">Foto cargada</p>
+                    <p className="text-[10px] text-indigo-400">Describe abajo los cambios a aplicar</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5 flex-shrink-0">
                   <button
                     onClick={() => fileInputRef.current?.click()}
                     className="p-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 rounded-lg border border-slate-700"
-                    title="Cambiar foto"
                   >
                     Cambiar
                   </button>
                   <button
                     onClick={() => setInputImage(null)}
                     className="p-1.5 text-xs text-red-400 hover:text-white bg-slate-800 rounded-lg border border-slate-700"
-                    title="Quitar foto"
                   >
                     <X className="w-3.5 h-3.5" />
                   </button>
@@ -371,13 +453,13 @@ export default function Home() {
                 className="w-full py-3 border-2 border-dashed border-indigo-500/40 hover:border-indigo-500 rounded-xl flex items-center justify-center gap-2 text-xs font-semibold text-indigo-300 active:scale-95 transition bg-indigo-950/20"
               >
                 <Camera className="w-4 h-4 text-indigo-400" />
-                <span>Tomar foto o subir desde tu galería</span>
+                <span>Toma una foto o elígela de tu galería</span>
               </button>
             )}
           </div>
         )}
 
-        {/* Visor de Imagen / Pantalla de Resultados */}
+        {/* Visor de Imagen */}
         <div className="w-full aspect-square rounded-2xl bg-slate-900/90 border border-slate-800/80 overflow-hidden relative flex items-center justify-center shadow-inner group">
           {loading ? (
             <div className="flex flex-col items-center justify-center p-6 text-center space-y-4">
@@ -386,12 +468,10 @@ export default function Home() {
                 <Sparkles className="w-6 h-6 text-indigo-400 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 animate-pulse" />
               </div>
               <div className="space-y-1">
-                <p className="text-sm font-semibold text-slate-200">
-                  {mode === "edit" ? "Modificando tu foto con Qwen AI..." : "Generando en GPU de Hugging Face..."}
-                </p>
+                <p className="text-sm font-semibold text-slate-200">{loadingStatus}</p>
                 <p className="text-xs text-indigo-400 font-mono">Tiempo: {elapsedTime}s</p>
                 <p className="text-[11px] text-slate-500 max-w-xs">
-                  Procesando detalles con precisión. Si el Space estaba inactivo, el primer inicio toma unos segundos.
+                  Procesando con Qwen-Image-2.1 en ZeroGPU sin intermediarios.
                 </p>
               </div>
             </div>
@@ -403,7 +483,6 @@ export default function Home() {
                 className="w-full h-full object-cover select-none"
               />
 
-              {/* Botón flotante para alternar y ver la foto Original vs Modificada */}
               {mode === "edit" && inputImage && currentImage && (
                 <button
                   onMouseDown={() => setShowOriginal(true)}
@@ -417,7 +496,6 @@ export default function Home() {
                 </button>
               )}
 
-              {/* Acciones sobre la imagen */}
               <div className="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-black/80 via-black/40 to-transparent flex items-center justify-end gap-2">
                 {currentImage && (
                   <>
@@ -453,12 +531,12 @@ export default function Home() {
               </div>
               <div className="space-y-1">
                 <p className="text-xs font-medium text-slate-300">
-                  {mode === "edit" ? "Sube una foto para comenzar a editar" : "Tu lienzo está vacío"}
+                  {mode === "edit" ? "Sube una foto para modificarla" : "Tu lienzo está vacío"}
                 </p>
                 <p className="text-[11px] text-slate-500 max-w-[220px]">
                   {mode === "edit" 
-                    ? "Puedes usar la cámara o elegir una foto de tu galería para transformarla"
-                    : "Escribe un prompt abajo o elige una sugerencia rápida"}
+                    ? "Toma una foto con tu cámara o elígela de tu galería"
+                    : "Escribe un prompt abajo o elige una sugerencia"}
                 </p>
               </div>
             </div>
@@ -475,16 +553,12 @@ export default function Home() {
           </div>
         )}
 
-        {/* Estilos o Sugerencias Rápidas */}
-        <div className="space-y-1.5">
-          <label className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold px-1 flex items-center justify-between">
-            <span>{mode === "edit" ? "Ideas de Modificación" : "Estilos Rápidos"}</span>
-            {mode === "edit" && (
-              <span className="text-[10px] text-indigo-400 font-normal">Intensidad: {Math.round(strength * 100)}%</span>
-            )}
-          </label>
-
-          {mode === "create" ? (
+        {/* Estilos */}
+        {mode === "create" && (
+          <div className="space-y-1.5">
+            <label className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold px-1">
+              Estilos Rápidos
+            </label>
             <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
               {STYLES.map((st) => {
                 const active = selectedStyle?.name === st.name;
@@ -503,27 +577,10 @@ export default function Home() {
                 );
               })}
             </div>
-          ) : (
-            <div className="space-y-2">
-              {/* Slider de intensidad de cambio */}
-              <div className="flex items-center gap-3 px-2 py-1 bg-slate-900/60 rounded-xl border border-slate-800 text-xs text-slate-400">
-                <span className="text-[10px]">Sutil</span>
-                <input 
-                  type="range" 
-                  min="0.3" 
-                  max="0.95" 
-                  step="0.05"
-                  value={strength}
-                  onChange={(e) => setStrength(parseFloat(e.target.value))}
-                  className="flex-1 accent-indigo-500 cursor-pointer"
-                />
-                <span className="text-[10px]">Radical</span>
-              </div>
-            </div>
-          )}
-        </div>
+          </div>
+        )}
 
-        {/* Área del Prompt */}
+        {/* Área de Prompt */}
         <div className="space-y-2">
           <div className="relative rounded-2xl bg-slate-900 border border-slate-800 focus-within:border-indigo-500/80 transition p-3">
             <textarea
@@ -531,7 +588,7 @@ export default function Home() {
               onChange={(e) => setPrompt(e.target.value)}
               placeholder={
                 mode === "edit"
-                  ? "Describe los cambios (ej: 'cambia la ropa por un traje de astronauta', 'estilo cómic con fondo de Tokio')..."
+                  ? "Describe los cambios (ej: 'cambia la ropa por armadura medieval', 'estilo anime Ghibli')..."
                   : "Describe en detalle lo que quieres ver..."
               }
               rows={3}
@@ -549,7 +606,7 @@ export default function Home() {
 
             <div className="flex items-center justify-between pt-2 border-t border-slate-800/60 text-xs text-slate-400">
               <span className="text-[11px]">
-                {mode === "edit" ? "Modo: Edición de Imagen" : (selectedStyle ? `Modo: ${selectedStyle.name}` : "Estilo libre")}
+                {mode === "edit" ? "Modo: Edición" : (selectedStyle ? `Estilo: ${selectedStyle.name}` : "Estilo libre")}
               </span>
               {mode === "create" && (
                 <div className="flex gap-1.5">
@@ -571,7 +628,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Sugerencias Rápidas en chips */}
           {!prompt && (
             <div className="flex flex-wrap gap-1.5 pt-1">
               {(mode === "edit" ? PRESET_EDIT_PROMPTS : PRESET_CREATION_PROMPTS).map((p, idx) => (
@@ -587,7 +643,7 @@ export default function Home() {
           )}
         </div>
 
-        {/* Botón de Acción Principal */}
+        {/* Botón de Generar */}
         <button
           onClick={handleProcess}
           disabled={loading || !prompt.trim() || (mode === "edit" && !inputImage)}
@@ -600,7 +656,7 @@ export default function Home() {
           {loading ? (
             <>
               <RefreshCw className="w-4 h-4 animate-spin" />
-              <span>{mode === "edit" ? "Modificando foto" : "Generando imagen"} ({elapsedTime}s)...</span>
+              <span>{loadingStatus} ({elapsedTime}s)</span>
             </>
           ) : mode === "edit" ? (
             <>
@@ -615,7 +671,7 @@ export default function Home() {
           )}
         </button>
 
-        {/* Galería e Historial */}
+        {/* Historial */}
         {history.length > 0 && (
           <div className="pt-4 border-t border-slate-800/60 space-y-2">
             <div className="flex items-center justify-between">
@@ -653,7 +709,7 @@ export default function Home() {
         )}
       </main>
 
-      {/* Modal de Configuración */}
+      {/* Modal Ajustes */}
       {showSettings && (
         <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fadeIn">
           <div className="w-full max-w-sm bg-[#0E1422] border border-slate-800 rounded-t-3xl sm:rounded-2xl p-5 space-y-4">

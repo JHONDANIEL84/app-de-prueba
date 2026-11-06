@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
 import { Client, handle_file } from "@gradio/client";
 
-export const maxDuration = 120; // Vercel function timeout config
+export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
-// Convert base64 data URL to Blob for Gradio upload
 function dataURLtoBlob(dataurl) {
   const arr = dataurl.split(",");
   const mime = arr[0].match(/:(.*?);/)[1];
@@ -17,119 +16,89 @@ function dataURLtoBlob(dataurl) {
   return new Blob([u8arr], { type: mime });
 }
 
+function mapRatioToSize(ratio) {
+  switch (ratio) {
+    case "16:9":
+      return "1344x768 (16:9)";
+    case "9:16":
+      return "768x1344 (9:16)";
+    case "4:3":
+      return "1184x864 (4:3)";
+    case "3:4":
+      return "864x1184 (3:4)";
+    default:
+      return "1024x1024 (1:1)";
+  }
+}
+
 export async function POST(request) {
   try {
     const body = await request.json();
     const { 
-      mode = "create", // "create" (text-to-image) or "edit" (image-to-image)
+      mode = "create", 
       prompt, 
-      negative_prompt = "", 
-      input_image = null, // base64 string
-      strength = 0.75, // image modification strength
+      input_image = null, 
       aspect_ratio = "1:1",
-      seed = Math.floor(Math.random() * 1000000),
-      steps = 25,
-      guidance_scale = 5.0,
+      steps = 26,
+      seed = 0,
       customSpace = "FelyaHuhing/qwen-image-21-uncensored",
       customToken = ""
     } = body;
 
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
-      return NextResponse.json({ error: "Describe lo que deseas generar o modificar" }, { status: 400 });
+      return NextResponse.json({ error: "El prompt es obligatorio" }, { status: 400 });
     }
 
     const token = customToken || process.env.HF_TOKEN || undefined;
-    const clientOptions = token ? { hf_token: token } : {};
-    const client = await Client.connect(customSpace, clientOptions);
+    const client = await Client.connect(customSpace, token ? { hf_token: token } : {});
 
     let result;
 
     if (mode === "edit" && input_image) {
-      // Modo Edición / Modificación de Imagen existente
       const blob = dataURLtoBlob(input_image);
-      const imageParam = typeof handle_file === "function" ? handle_file(blob) : blob;
+      const imgParam = typeof handle_file === "function" ? handle_file(blob) : blob;
 
-      // Intentar diferentes formatos de endpoints de edición en Gradio
-      try {
-        result = await client.predict("/edit", [
-          imageParam,
-          prompt,
-          negative_prompt,
-          strength,
-          seed,
-        ]);
-      } catch (e1) {
-        try {
-          result = await client.predict("/image_to_image", [
-            imageParam,
-            prompt,
-            negative_prompt,
-            strength,
-          ]);
-        } catch (e2) {
-          try {
-            // Intento con parámetros ordenados (prompt, image)
-            result = await client.predict(0, [
-              prompt,
-              imageParam,
-              negative_prompt,
-              seed,
-            ]);
-          } catch (e3) {
-            // Intento con (image, prompt)
-            result = await client.predict(0, [
-              imageParam,
-              prompt,
-              seed,
-            ]);
-          }
-        }
-      }
+      result = await client.predict("/edit", {
+        prompt: prompt.trim(),
+        input_image: imgParam,
+        extra_images: [],
+        steps: Math.min(Math.max(steps, 8), 40),
+        seed: seed || 0,
+        randomize_seed: true,
+        lora_scale: 1.0,
+      });
     } else {
-      // Modo Creación (Texto a Imagen)
-      try {
-        result = await client.predict("/predict", [
-          prompt,
-          negative_prompt,
-          seed,
-          guidance_scale,
-          steps,
-        ]);
-      } catch (predictErr) {
-        try {
-          result = await client.predict(0, [
-            prompt,
-            negative_prompt,
-            seed,
-          ]);
-        } catch (fallbackErr) {
-          result = await client.predict(0, [prompt]);
-        }
-      }
+      result = await client.predict("/generate", {
+        prompt: prompt.trim(),
+        size: mapRatioToSize(aspect_ratio),
+        steps: Math.min(Math.max(steps, 8), 40),
+        seed: seed || 0,
+        randomize_seed: true,
+        lora_scale: 1.0,
+      });
     }
 
-    // Extraer la imagen resultante
     let imageUrl = null;
+    let usedSeed = seed;
+
     if (result && result.data) {
       const data = result.data;
       if (Array.isArray(data)) {
-        for (const item of data) {
-          if (typeof item === "string" && (item.startsWith("http") || item.startsWith("data:image"))) {
-            imageUrl = item;
-            break;
-          } else if (item && typeof item === "object" && item.url) {
-            imageUrl = item.url;
-            break;
-          }
+        const imgObj = data[0];
+        if (typeof imgObj === "string") {
+          imageUrl = imgObj;
+        } else if (imgObj && typeof imgObj === "object") {
+          imageUrl = imgObj.url || imgObj.path;
         }
-      } else if (typeof data === "string") {
-        imageUrl = data;
+        if (data.length > 1 && typeof data[1] === "number") {
+          usedSeed = data[1];
+        }
       }
     }
 
     if (!imageUrl) {
       return NextResponse.json({ 
-        error: "No se pudo recuperar la imagen modificada por el Space.",
+        error: "El Space no devolvió una imagen válida.",
         raw: result ? result.data : null 
       }, { status: 502 });
     }
@@ -137,15 +106,15 @@ export async function POST(request) {
     return NextResponse.json({
       success: true,
       imageUrl,
-      seed,
+      seed: usedSeed,
       prompt,
     });
   } catch (error) {
-    console.error("Error en generación/edición:", error);
+    console.error("Error en route.js:", error);
     return NextResponse.json(
       { 
-        error: error.message || "Error al procesar con Hugging Face",
-        details: "El Space puede estar en reposo temporal o procesando otra petición. Vuelve a intentarlo en unos segundos."
+        error: error.message || "Error al procesar en Hugging Face",
+        details: "Hugging Face ZeroGPU puede estar ocupado. Intenta de nuevo en unos segundos."
       },
       { status: 500 }
     );
